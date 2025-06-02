@@ -25,6 +25,10 @@ rpc_server_instance = None
 rpc_request_queue = queue.Queue()
 rpc_response_queue = queue.Queue()
 
+# Selection Buffer - stores the current selection snapshot
+selection_buffer = []
+selection_buffer_timestamp = None
+
 
 def process_gui_tasks():
     while not rpc_request_queue.empty():
@@ -423,10 +427,177 @@ class FreeCADRPC:
                 raise ValueError(f"Invalid view name: {view_name}")
             view.fitAll()
             view.saveImage(save_path, 1)
-            return True
+            return True        
         except Exception as e:
-            return str(e)
+            return str(e)   
+        
+    def _send_selection_to_buffer_gui(self):
+        """Capture current selection and store in buffer (GUI thread)"""
+        global selection_buffer, selection_buffer_timestamp
+        import datetime
+        
+        try:
+            FreeCAD.Console.PrintMessage("Starting selection capture...\n")
+            # Get current selection from FreeCAD with subelements
+            selection_ex = FreeCADGui.Selection.getSelectionEx()
+            FreeCAD.Console.PrintMessage(f"Found {len(selection_ex)} selected objects\n")
+            
+            # Clear existing buffer and capture new selection
+            selection_buffer = []
+            
+            # Process each selection (object with its subelements)
+            for i, sel_obj in enumerate(selection_ex):
+                obj = sel_obj.Object
+                subelements = sel_obj.SubElementNames
+                FreeCAD.Console.PrintMessage(f"Processing object {i}: {obj.Name} with {len(subelements)} subelements\n")
+                
+                try:
+                    # Serialize the main object
+                    serialized_obj = serialize_object(obj)
+                    
+                    # Add subelement information
+                    serialized_obj["SubElements"] = {
+                        "Names": subelements,
+                        "Count": len(subelements)
+                    }
+                    
+                    # Add detailed subelement information if available
+                    if subelements:
+                        subelement_details = []
+                        for sub_name in subelements:
+                            sub_info = {
+                                "Name": sub_name,
+                                "Type": "Unknown"  # Default type
+                            }
+                            
+                            # Determine subelement type
+                            if sub_name.startswith("Face"):
+                                sub_info["Type"] = "Face"
+                            elif sub_name.startswith("Edge"):
+                                sub_info["Type"] = "Edge"
+                            elif sub_name.startswith("Vertex"):
+                                sub_info["Type"] = "Vertex"
+                            
+                            subelement_details.append(sub_info)
+                        
+                        serialized_obj["SubElements"]["Details"] = subelement_details
+                        FreeCAD.Console.PrintMessage(f"  → Captured subelements: {', '.join(subelements)}\n")
+                    
+                    selection_buffer.append(serialized_obj)
+                    FreeCAD.Console.PrintMessage(f"  ✓ Successfully serialized {obj.Name}\n")
+                    
+                except Exception as e:
+                    FreeCAD.Console.PrintError(f"  ✗ Error serializing {obj.Name}: {e}\n")
+                    return {"success": False, "error": f"Serialization error for {obj.Name}: {e}"}
+            
+            # Update timestamp
+            selection_buffer_timestamp = datetime.datetime.now().isoformat()
+            count = len(selection_buffer)
+            
+            FreeCAD.Console.PrintMessage(f"Selection capture completed: {count} objects\n")
+            return {"success": True, "count": count, "message": f"Selection buffer updated with {count} objects"}
+            
+        except Exception as e:
+            FreeCAD.Console.PrintError(f"Error capturing selection: {e}\n")
+            return {"success": False, "error": str(e)}
 
+    def send_selection_to_buffer(self):
+        """Capture current FreeCAD selection and store in buffer (replacing previous)"""
+        # Execute directly without queue to avoid deadlock
+        result = self._send_selection_to_buffer_gui()
+        if isinstance(result, dict) and result.get("success"):
+            return result
+        else:
+            return {"success": False, "error": result}
+
+    def get_selection_buffer(self):
+        """Get current selection buffer contents (non-destructive)"""
+        global selection_buffer, selection_buffer_timestamp
+        return {
+            "success": True,
+            "selections": selection_buffer,
+            "timestamp": selection_buffer_timestamp,
+            "count": len(selection_buffer)
+        }
+
+    def get_buffer_status(self):
+        """Check buffer state"""
+        global selection_buffer, selection_buffer_timestamp
+        return {
+            "success": True,
+            "has_selections": len(selection_buffer) > 0,
+            "count": len(selection_buffer),
+            "timestamp": selection_buffer_timestamp
+        }
+
+    def clear_selection_buffer(self):
+        """Clear the selection buffer"""
+        global selection_buffer, selection_buffer_timestamp
+        selection_buffer = []
+        selection_buffer_timestamp = None
+        return {"success": True, "message": "Selection buffer cleared"}
+
+    def get_selection_workflow_strategy(self):
+        """Returns the proper usage strategy for the model"""
+        strategy = """
+Selection Workflow Strategy for FreeCAD MCP:
+
+1. Understand the task required by the user
+2. Direct user to select the entities and click "Send Selection to MCP" button
+3. Retrieve the selection using get_selection_buffer()
+4. Perform the operation until no errors arise
+5. Get user feedback if the action was as intended
+6. If not satisfied, return to step 1 (skipping step 2 - selection already in buffer)
+7. If user is satisfied, call clear_selection_buffer()
+
+This workflow ensures explicit user control while providing reliable data persistence for AI model operations.
+Selection data persists until explicitly cleared, allowing for retries and refinements.
+"""
+        return {"success": True, "strategy": strategy}
+
+    def get_coordinate_handling_strategy(self):
+        """Returns best practices for handling coordinates from FreeCAD selections"""
+        strategy = """
+CRITICAL: FreeCAD Coordinate Handling Best Practices
+
+WRONG APPROACH (causes double-transformation):
+1. Manually extracting geometry points from sketch local coordinates
+2. Then applying obj.Placement.multVec() transformation
+3. This double-transforms coordinates and gives incorrect results
+
+CORRECT APPROACH:
+1. Use FreeCAD's selection API directly: FreeCADGui.Selection.getSelectionEx()
+2. Access sel.SubObjects[j].Point - this already provides GLOBAL coordinates
+3. NO manual transformation needed - coordinates are already in global space
+
+EXAMPLE CORRECT CODE:
+```python
+selection_ex = FreeCADGui.Selection.getSelectionEx()
+for sel in selection_ex:
+    for i, sub_name in enumerate(sel.SubElementNames):
+        if sub_name.startswith('Vertex'):
+            # This point is already in global coordinates!
+            global_point = sel.SubObjects[i].Point
+            # Use global_point directly - no transformation needed
+```
+
+VERTEX COORDINATE EXTRACTION:
+- sel.SubObjects[i].Point returns FreeCAD.Vector in global coordinates
+- For sketch vertices, these are already transformed to 3D space
+- For 3D object vertices, these are already in the document coordinate system
+
+COMMON MISTAKE TO AVOID:
+- Do NOT use obj.Shape.Vertexes[i].Point and then transform
+- Do NOT manually apply placement transformations to selection coordinates
+- The selection API handles all coordinate transformations automatically
+
+WHEN TO USE TRANSFORMATIONS:
+- Only when working with raw geometry data NOT from selections
+- When creating new geometry that needs to be positioned relative to objects
+- When working with local coordinate systems for construction purposes
+"""
+        return {"success": True, "strategy": strategy}
+        
 
 def start_rpc_server(host="localhost", port=9875):
     global rpc_server_thread, rpc_server_instance
@@ -489,5 +660,32 @@ class StopRPCServerCommand:
         return True
 
 
+class SendSelectionToMCPCommand:
+    def GetResources(self):
+        return {
+            "MenuText": "Send Selection to MCP", 
+            "ToolTip": "Capture current selection and send to MCP server buffer"
+        }
+
+    def Activated(self):
+        global rpc_server_instance
+        if rpc_server_instance:
+            # Use the RPC instance to send selection to buffer
+            rpc = FreeCADRPC()
+            result = rpc.send_selection_to_buffer()
+            if result["success"]:
+                FreeCAD.Console.PrintMessage(f"✓ {result['message']}\n")
+            else:
+                FreeCAD.Console.PrintError(f"✗ Failed to send selection: {result['error']}\n")
+        else:
+            FreeCAD.Console.PrintWarning("⚠ RPC Server is not running. Please start it first.\n")
+
+    def IsActive(self):
+        # Only active when there's a selection and RPC server is running
+        return (FreeCADGui.Selection.hasSelection() and 
+                rpc_server_instance is not None)
+
+
 FreeCADGui.addCommand("Start_RPC_Server", StartRPCServerCommand())
 FreeCADGui.addCommand("Stop_RPC_Server", StopRPCServerCommand())
+FreeCADGui.addCommand("Send_Selection_to_MCP", SendSelectionToMCPCommand())

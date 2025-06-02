@@ -5,7 +5,7 @@ class FreeCADMCPAddonWorkbench(Workbench):
     def Initialize(self):
         from rpc_server import rpc_server
 
-        commands = ["Start_RPC_Server", "Stop_RPC_Server"]
+        commands = ["Start_RPC_Server", "Stop_RPC_Server", "Send_Selection_to_MCP"]
         self.appendToolbar("FreeCAD MCP", commands)
         self.appendMenu("FreeCAD MCP", commands)
 

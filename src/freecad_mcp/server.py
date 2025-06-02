@@ -46,25 +46,25 @@ class FreeCADConnection:
         try:
             # Check if we're in a view that supports screenshots
             result = self.server.execute_code("""
-import FreeCAD
-import FreeCADGui
+    import FreeCAD
+    import FreeCADGui
 
-if FreeCAD.Gui.ActiveDocument and FreeCAD.Gui.ActiveDocument.ActiveView:
-    view_type = type(FreeCAD.Gui.ActiveDocument.ActiveView).__name__
-    
-    # These view types don't support screenshots
-    unsupported_views = ['SpreadsheetGui::SheetView', 'DrawingGui::DrawingView', 'TechDrawGui::MDIViewPage']
-    
-    if view_type in unsupported_views or not hasattr(FreeCAD.Gui.ActiveDocument.ActiveView, 'saveImage'):
-        print("Current view does not support screenshots")
-        False
+    if FreeCAD.Gui.ActiveDocument and FreeCAD.Gui.ActiveDocument.ActiveView:
+        view_type = type(FreeCAD.Gui.ActiveDocument.ActiveView).__name__
+        
+        # These view types don't support screenshots
+        unsupported_views = ['SpreadsheetGui::SheetView', 'DrawingGui::DrawingView', 'TechDrawGui::MDIViewPage']
+        
+        if view_type in unsupported_views or not hasattr(FreeCAD.Gui.ActiveDocument.ActiveView, 'saveImage'):
+            print("Current view does not support screenshots")
+            False
+        else:
+            print(f"Current view supports screenshots: {view_type}")
+            True
     else:
-        print(f"Current view supports screenshots: {view_type}")
-        True
-else:
-    print("No active view")
-    False
-""")
+        print("No active view")
+        False
+    """)
 
             # If the view doesn't support screenshots, return None
             if not result.get("success", False) or "Current view does not support screenshots" in result.get("message", ""):
@@ -86,6 +86,63 @@ else:
 
     def get_parts_list(self) -> list[str]:
         return self.server.get_parts_list()
+
+    def get_selection_buffer(self) -> dict[str, Any]:
+        """Get current selections from the FreeCAD selection buffer (non-destructive).
+
+        This method retrieves the objects that were explicitly sent to the MCP by the user
+        clicking the "Send Selection to MCP" button in FreeCAD. The selection buffer
+        maintains the user's selection order and persists until cleared.
+
+        Returns:
+            A dictionary containing the selection buffer contents with object details and metadata.
+        """
+        return self.server.get_selection_buffer()
+
+    def get_buffer_status(self) -> dict[str, Any]:
+        """Check the current state of the selection buffer.
+
+        Returns information about whether the buffer has selections, count, and timestamp
+        without returning the actual selection data.
+
+        Returns:
+            A dictionary containing the buffer status information.
+        """
+        return self.server.get_buffer_status()
+
+    def clear_selection_buffer(self) -> dict[str, Any]:
+        """Clear the selection buffer after successful operation completion.
+
+        This should only be called after the user confirms they are satisfied
+        with the AI model's work. This allows the model to retry operations
+        using the same selection data until the user is happy with the result.
+
+        Returns:
+            A dictionary confirming that the buffer has been cleared.
+        """
+        return self.server.clear_selection_buffer()
+
+    def get_selection_workflow_strategy(self) -> dict[str, Any]:
+        """Get the recommended workflow strategy for using the selection buffer.
+
+        This method provides the AI model with the proper workflow for managing
+        user selections and ensuring reliable operation retry capabilities.
+
+        Returns:
+            A dictionary containing the selection workflow strategy guide.
+        """
+        return self.server.get_selection_workflow_strategy()
+
+    def get_coordinate_handling_strategy(self) -> dict[str, Any]:
+        """Get best practices for handling coordinates from FreeCAD selections.
+
+        This method provides critical guidance on the correct way to extract and use
+        coordinates from FreeCAD selections, avoiding common double-transformation mistakes.
+
+        Returns:
+            A dictionary containing coordinate handling best practices and examples.
+        """
+        return self.server.get_coordinate_handling_strategy()
 
 
 @asynccontextmanager
@@ -194,7 +251,7 @@ def create_object(
     obj_name: str,
     analysis_name: str | None = None,
     obj_properties: dict[str, Any] = None,
-) -> list[TextContent | ImageContent]:
+    ) -> list[TextContent | ImageContent]:
     """Create a new object in FreeCAD.
     Object type is starts with "Part::" or "Draft::" or "PartDesign::" or "Fem::".
 
@@ -336,7 +393,7 @@ def create_object(
 @mcp.tool()
 def edit_object(
     ctx: Context, doc_name: str, obj_name: str, obj_properties: dict[str, Any]
-) -> list[TextContent | ImageContent]:
+    ) -> list[TextContent | ImageContent]:
     """Edit an object in FreeCAD.
     This tool is used when the `create_object` tool cannot handle the object creation.
 
@@ -560,6 +617,160 @@ def get_parts_list(ctx: Context) -> list[str]:
     else:
         return [
             TextContent(type="text", text=f"No parts found in the parts library. You must add parts_library addon.")
+        ]
+
+
+@mcp.tool()
+def get_selection_buffer(ctx: Context) -> list[TextContent]:
+    """Get current selections from the FreeCAD selection buffer (non-destructive).
+    
+    This tool retrieves the objects that were explicitly sent to the MCP by the user
+    clicking the "Send Selection to MCP" button in FreeCAD. The selection buffer
+    maintains the user's selection order and persists until cleared.
+    
+    Returns:
+        The current selection buffer contents with object details and metadata.
+    """
+    freecad = get_freecad_connection()
+    try:
+        result = freecad.get_selection_buffer()
+        if result["success"]:
+            return [
+                TextContent(
+                    type="text", 
+                    text=f"Selection Buffer (count: {result['count']}, timestamp: {result['timestamp']}):\n" +
+                         json.dumps(result["selections"], indent=2)
+                )
+            ]
+        else:
+            return [
+                TextContent(type="text", text=f"Failed to get selection buffer: {result.get('error', 'Unknown error')}")
+            ]
+    except Exception as e:
+        logger.error(f"Failed to get selection buffer: {str(e)}")
+        return [
+            TextContent(type="text", text=f"Failed to get selection buffer: {str(e)}")
+        ]
+
+
+@mcp.tool()
+def get_buffer_status(ctx: Context) -> list[TextContent]:
+    """Check the current state of the selection buffer.
+    
+    Returns information about whether the buffer has selections, count, and timestamp
+    without returning the actual selection data.
+    
+    Returns:
+        Buffer status information.
+    """
+    freecad = get_freecad_connection()
+    try:
+        result = freecad.get_buffer_status()
+        if result["success"]:
+            status = "✓ Has selections" if result["has_selections"] else "✗ Empty"
+            return [
+                TextContent(
+                    type="text", 
+                    text=f"Selection Buffer Status: {status}\n" +
+                         f"Count: {result['count']}\n" +
+                         f"Timestamp: {result['timestamp']}"
+                )
+            ]
+        else:
+            return [
+                TextContent(type="text", text=f"Failed to get buffer status: {result.get('error', 'Unknown error')}")
+            ]
+    except Exception as e:
+        logger.error(f"Failed to get buffer status: {str(e)}")
+        return [
+            TextContent(type="text", text=f"Failed to get buffer status: {str(e)}")
+        ]
+
+
+@mcp.tool()
+def clear_selection_buffer(ctx: Context) -> list[TextContent]:
+    """Clear the selection buffer after successful operation completion.
+    
+    This should only be called after the user confirms they are satisfied
+    with the AI model's work. This allows the model to retry operations
+    using the same selection data until the user is happy with the result.
+    
+    Returns:
+        Confirmation that the buffer has been cleared.
+    """
+    freecad = get_freecad_connection()
+    try:
+        result = freecad.clear_selection_buffer()
+        if result["success"]:
+            return [
+                TextContent(type="text", text="✓ Selection buffer cleared successfully")
+            ]
+        else:
+            return [
+                TextContent(type="text", text=f"Failed to clear selection buffer: {result.get('error', 'Unknown error')}")
+            ]
+    except Exception as e:
+        logger.error(f"Failed to clear selection buffer: {str(e)}")
+        return [
+            TextContent(type="text", text=f"Failed to clear selection buffer: {str(e)}")
+        ]
+
+
+@mcp.tool()
+def get_selection_workflow_strategy(ctx: Context) -> list[TextContent]:
+    """Get the recommended workflow strategy for using the selection buffer.
+    
+    This tool provides the AI model with the proper workflow for managing
+    user selections and ensuring reliable operation retry capabilities.
+    
+    Returns:
+        The selection workflow strategy guide.
+    """
+    freecad = get_freecad_connection()
+    try:
+        result = freecad.get_selection_workflow_strategy()
+        if result["success"]:
+            return [
+                TextContent(type="text", text=result["strategy"])
+            ]
+        else:
+            return [
+                TextContent(type="text", text=f"Failed to get workflow strategy: {result.get('error', 'Unknown error')}")
+            ]
+    except Exception as e:
+        logger.error(f"Failed to get workflow strategy: {str(e)}")
+        return [
+            TextContent(type="text", text=f"Failed to get workflow strategy: {str(e)}")
+        ]
+
+
+@mcp.tool()
+def get_coordinate_handling_strategy(ctx: Context) -> list[TextContent]:
+    """Get best practices for handling coordinates from FreeCAD selections.
+    
+    This tool provides critical guidance on the correct way to extract and use
+    coordinates from FreeCAD selections, avoiding common double-transformation mistakes.
+    Use this tool when working with vertex coordinates, points, or any geometric data
+    extracted from user selections.
+    
+    Returns:
+        Coordinate handling best practices and examples.
+    """
+    freecad = get_freecad_connection()
+    try:
+        result = freecad.get_coordinate_handling_strategy()
+        if result["success"]:
+            return [
+                TextContent(type="text", text=result["strategy"])
+            ]
+        else:
+            return [
+                TextContent(type="text", text=f"Failed to get coordinate handling strategy: {result.get('error', 'Unknown error')}")
+            ]
+    except Exception as e:
+        logger.error(f"Failed to get coordinate handling strategy: {str(e)}")
+        return [
+            TextContent(type="text", text=f"Failed to get coordinate handling strategy: {str(e)}")
         ]
 
 

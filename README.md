@@ -120,3 +120,26 @@ git clone https://github.com/neka-nat/freecad-mcp.git
 * `get_objects`: Get all objects in a document.
 * `get_object`: Get an object in a document.
 * `get_parts_list`: Get the list of parts in the [parts library](https://github.com/FreeCAD/FreeCAD-library).
+
+### Selection Buffer Tools
+
+The selection buffer feature allows explicit user control over which objects the AI model operates on:
+
+* `get_selection_buffer`: Get current selections from the buffer (non-destructive).
+* `get_buffer_status`: Check if buffer has selections and metadata.
+* `clear_selection_buffer`: Clear buffer after successful operations.
+* `get_selection_workflow_strategy`: Get the recommended workflow for using selections.
+
+#### Selection Workflow
+
+1. User selects objects in FreeCAD GUI
+2. User clicks "Send Selection to MCP" button in the addon toolbar
+3. AI model uses `get_selection_buffer()` to retrieve selections
+4. AI model performs operations, with retry capability using same selection data
+5. After user confirms satisfaction, AI model calls `clear_selection_buffer()`
+
+This workflow ensures:
+- **Explicit user control**: Users decide exactly which objects to send
+- **Selection persistence**: Data remains available for retries until cleared
+- **Order preservation**: Maintains user's selection sequence
+- **No data loss**: Selections persist even if model isn't actively listening
