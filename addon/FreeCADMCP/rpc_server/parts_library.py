@@ -1,5 +1,4 @@
 import os
-from functools import cache
 
 import FreeCAD
 import FreeCADGui
@@ -7,20 +6,32 @@ import FreeCADGui
 
 def insert_part_from_library(relative_path):
     parts_lib_path = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "parts_library")
-    part_path = os.path.join(parts_lib_path, relative_path)
+    parts_lib_real = os.path.realpath(parts_lib_path)
+    part_path = os.path.realpath(os.path.join(parts_lib_path, relative_path))
+
+    # os.path.join drops parts_lib_path for an absolute relative_path, and
+    # neither join nor realpath rejects a ".." that walks outside it.
+    if os.path.commonpath([part_path, parts_lib_real]) != parts_lib_real:
+        raise ValueError(f"relative_path escapes the parts library: {relative_path}")
 
     if not os.path.exists(part_path):
         raise FileNotFoundError(f"Not found: {part_path}")
 
+    # mergeProject inserts into the active document; create one if none is open
+    # so we fail with a clear path instead of an AttributeError on None.
+    if FreeCADGui.ActiveDocument is None:
+        FreeCAD.newDocument()
+
     FreeCADGui.ActiveDocument.mergeProject(part_path)
 
 
-@cache
 def get_parts_list() -> list[str]:
     parts_lib_path = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "parts_library")
 
     if not os.path.exists(parts_lib_path):
-        raise FileNotFoundError(f"Not found: {parts_lib_path}")
+        # Library addon not installed — return empty so the caller can show a
+        # friendly "no parts found" message instead of raising over XML-RPC.
+        return []
 
     parts = []
 

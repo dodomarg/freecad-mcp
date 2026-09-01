@@ -1,148 +1,55 @@
-import json
 import logging
-import xmlrpc.client
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, Literal
+from typing import Any, AsyncIterator, Dict, Literal
 
-from mcp.server.fastmcp import FastMCP, Context
-from mcp.types import TextContent, ImageContent
+try:
+    # mcp 1.x
+    from mcp.server.fastmcp import Context, FastMCP
+except ImportError:
+    # mcp 2.x moved mcp.server.fastmcp to mcp.server.mcpserver and renamed
+    # FastMCP to MCPServer; the API surface used here is unchanged.
+    from mcp.server.mcpserver import Context
+    from mcp.server.mcpserver import MCPServer as FastMCP
+from mcp.types import ImageContent, TextContent
 
-# Configure logging
+from .freecad_client import FreeCADConnection
+from .operations import (
+    clear_selection_buffer_operation,
+    create_document_operation,
+    create_object_operation,
+    delete_object_operation,
+    edit_object_operation,
+    execute_code_async_operation,
+    execute_code_operation,
+    get_buffer_status_operation,
+    get_coordinate_handling_strategy_operation,
+    get_object_operation,
+    get_objects_operation,
+    get_parts_list_operation,
+    get_rpc_status_operation,
+    get_selection_buffer_operation,
+    get_selection_workflow_strategy_operation,
+    get_view_operation,
+    insert_part_from_library_operation,
+    list_documents_operation,
+    reload_document_operation,
+    run_fem_analysis_operation,
+)
+from .prompt_text import ASSET_CREATION_STRATEGY
+from .server_state import ServerState
+
+
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("FreeCADMCPserver")
+logger.setLevel(logging.INFO)
 
+ViewName = Literal[
+    "Isometric", "Front", "Top", "Right", "Back", "Left", "Bottom", "Dimetric", "Trimetric"
+]
 
-_only_text_feedback = False
-
-
-class FreeCADConnection:
-    def __init__(self, host: str = "localhost", port: int = 9875):
-        self.server = xmlrpc.client.ServerProxy(f"http://{host}:{port}", allow_none=True)
-
-    def ping(self) -> bool:
-        return self.server.ping()
-
-    def create_document(self, name: str) -> dict[str, Any]:
-        return self.server.create_document(name)
-
-    def create_object(self, doc_name: str, obj_data: dict[str, Any]) -> dict[str, Any]:
-        return self.server.create_object(doc_name, obj_data)
-
-    def edit_object(self, doc_name: str, obj_name: str, obj_data: dict[str, Any]) -> dict[str, Any]:
-        return self.server.edit_object(doc_name, obj_name, obj_data)
-
-    def delete_object(self, doc_name: str, obj_name: str) -> dict[str, Any]:
-        return self.server.delete_object(doc_name, obj_name)
-
-    def insert_part_from_library(self, relative_path: str) -> dict[str, Any]:
-        return self.server.insert_part_from_library(relative_path)
-
-    def execute_code(self, code: str) -> dict[str, Any]:
-        return self.server.execute_code(code)
-
-    def get_active_screenshot(self, view_name: str = "Isometric") -> str | None:
-        try:
-            # Check if we're in a view that supports screenshots
-            result = self.server.execute_code("""
-    import FreeCAD
-    import FreeCADGui
-
-    if FreeCAD.Gui.ActiveDocument and FreeCAD.Gui.ActiveDocument.ActiveView:
-        view_type = type(FreeCAD.Gui.ActiveDocument.ActiveView).__name__
-        
-        # These view types don't support screenshots
-        unsupported_views = ['SpreadsheetGui::SheetView', 'DrawingGui::DrawingView', 'TechDrawGui::MDIViewPage']
-        
-        if view_type in unsupported_views or not hasattr(FreeCAD.Gui.ActiveDocument.ActiveView, 'saveImage'):
-            print("Current view does not support screenshots")
-            False
-        else:
-            print(f"Current view supports screenshots: {view_type}")
-            True
-    else:
-        print("No active view")
-        False
-    """)
-
-            # If the view doesn't support screenshots, return None
-            if not result.get("success", False) or "Current view does not support screenshots" in result.get("message", ""):
-                logger.info("Screenshot unavailable in current view (likely Spreadsheet or TechDraw view)")
-                return None
-
-            # Otherwise, try to get the screenshot
-            return self.server.get_active_screenshot(view_name)
-        except Exception as e:
-            # Log the error but return None instead of raising an exception
-            logger.error(f"Error getting screenshot: {e}")
-            return None
-
-    def get_objects(self, doc_name: str) -> list[dict[str, Any]]:
-        return self.server.get_objects(doc_name)
-
-    def get_object(self, doc_name: str, obj_name: str) -> dict[str, Any]:
-        return self.server.get_object(doc_name, obj_name)
-
-    def get_parts_list(self) -> list[str]:
-        return self.server.get_parts_list()
-
-    def get_selection_buffer(self) -> dict[str, Any]:
-        """Get current selections from the FreeCAD selection buffer (non-destructive).
-
-        This method retrieves the objects that were explicitly sent to the MCP by the user
-        clicking the "Send Selection to MCP" button in FreeCAD. The selection buffer
-        maintains the user's selection order and persists until cleared.
-
-        Returns:
-            A dictionary containing the selection buffer contents with object details and metadata.
-        """
-        return self.server.get_selection_buffer()
-
-    def get_buffer_status(self) -> dict[str, Any]:
-        """Check the current state of the selection buffer.
-
-        Returns information about whether the buffer has selections, count, and timestamp
-        without returning the actual selection data.
-
-        Returns:
-            A dictionary containing the buffer status information.
-        """
-        return self.server.get_buffer_status()
-
-    def clear_selection_buffer(self) -> dict[str, Any]:
-        """Clear the selection buffer after successful operation completion.
-
-        This should only be called after the user confirms they are satisfied
-        with the AI model's work. This allows the model to retry operations
-        using the same selection data until the user is happy with the result.
-
-        Returns:
-            A dictionary confirming that the buffer has been cleared.
-        """
-        return self.server.clear_selection_buffer()
-
-    def get_selection_workflow_strategy(self) -> dict[str, Any]:
-        """Get the recommended workflow strategy for using the selection buffer.
-
-        This method provides the AI model with the proper workflow for managing
-        user selections and ensuring reliable operation retry capabilities.
-
-        Returns:
-            A dictionary containing the selection workflow strategy guide.
-        """
-        return self.server.get_selection_workflow_strategy()
-
-    def get_coordinate_handling_strategy(self) -> dict[str, Any]:
-        """Get best practices for handling coordinates from FreeCAD selections.
-
-        This method provides critical guidance on the correct way to extract and use
-        coordinates from FreeCAD selections, avoiding common double-transformation mistakes.
-
-        Returns:
-            A dictionary containing coordinate handling best practices and examples.
-        """
-        return self.server.get_coordinate_handling_strategy()
+state = ServerState()
 
 
 @asynccontextmanager
@@ -159,55 +66,34 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             )
         yield {}
     finally:
-        # Clean up the global connection on shutdown
-        global _freecad_connection
-        if _freecad_connection:
+        if state.freecad_connection:
             logger.info("Disconnecting from FreeCAD on shutdown")
-            _freecad_connection.disconnect()
-            _freecad_connection = None
+            state.freecad_connection.disconnect()
+            state.freecad_connection = None
         logger.info("FreeCADMCP server shut down")
 
 
 mcp = FastMCP(
     "FreeCADMCP",
-    description="FreeCAD integration through the Model Context Protocol",
+    instructions="FreeCAD integration through the Model Context Protocol",
     lifespan=server_lifespan,
 )
 
 
-_freecad_connection: FreeCADConnection | None = None
-
-
-def get_freecad_connection():
+def get_freecad_connection() -> FreeCADConnection:
     """Get or create a persistent FreeCAD connection"""
-    global _freecad_connection
-    if _freecad_connection is None:
-        _freecad_connection = FreeCADConnection(host="localhost", port=9875)
-        if not _freecad_connection.ping():
+    if state.freecad_connection is None:
+        state.freecad_connection = FreeCADConnection(host=state.rpc_host, port=9875)
+        if not state.freecad_connection.ping():
             logger.error("Failed to ping FreeCAD")
-            _freecad_connection = None
+            state.freecad_connection = None
             raise Exception(
                 "Failed to connect to FreeCAD. Make sure the FreeCAD addon is running."
             )
-    return _freecad_connection
+    return state.freecad_connection
 
 
-# Helper function to safely add screenshot to response
-def add_screenshot_if_available(response, screenshot):
-    """Safely add screenshot to response only if it's available"""
-    if screenshot is not None and not _only_text_feedback:
-        response.append(ImageContent(type="image", data=screenshot, mimeType="image/png"))
-    elif not _only_text_feedback:
-        # Add an informative message that will be seen by the AI model and user
-        response.append(TextContent(
-            type="text", 
-            text="Note: Visual preview is unavailable in the current view type (such as TechDraw or Spreadsheet). "
-                 "Switch to a 3D view to see visual feedback."
-        ))
-    return response
-
-
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_document(ctx: Context, name: str) -> list[TextContent]:
     """Create a new document in FreeCAD.
 
@@ -225,25 +111,10 @@ def create_document(ctx: Context, name: str) -> list[TextContent]:
         }
         ```
     """
-    freecad = get_freecad_connection()
-    try:
-        res = freecad.create_document(name)
-        if res["success"]:
-            return [
-                TextContent(type="text", text=f"Document '{res['document_name']}' created successfully")
-            ]
-        else:
-            return [
-                TextContent(type="text", text=f"Failed to create document: {res['error']}")
-            ]
-    except Exception as e:
-        logger.error(f"Failed to create document: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to create document: {str(e)}")
-        ]
+    return create_document_operation(get_freecad_connection(), name)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_object(
     ctx: Context,
     doc_name: str,
@@ -251,7 +122,9 @@ def create_object(
     obj_name: str,
     analysis_name: str | None = None,
     obj_properties: dict[str, Any] = None,
-    ) -> list[TextContent | ImageContent]:
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
     """Create a new object in FreeCAD.
     Object type is starts with "Part::" or "Draft::" or "PartDesign::" or "Fem::".
 
@@ -260,6 +133,11 @@ def create_object(
         obj_type: The type of the object to create (e.g. 'Part::Box', 'Part::Cylinder', 'Draft::Circle', 'PartDesign::Body', etc.).
         obj_name: The name of the object to create.
         obj_properties: The properties of the object to create.
+        include_screenshot: Whether to return a screenshot of the model (default True).
+            Set to False to save tokens when visual feedback is not needed,
+            e.g. for intermediate steps in a longer sequence of changes.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
+            Pick the view that best shows the change being made.
 
     Returns:
         A message indicating the success or failure of the object creation and a screenshot of the object.
@@ -351,7 +229,9 @@ def create_object(
         ```
 
         If you want to create a FEM mesh, you can use the following data.
-        The `Part` property is required.
+        The `Shape` property is required (legacy `Part` is also accepted).
+        On FreeCAD 1.x the size limits are `CharacteristicLengthMax/Min`;
+        the legacy `ElementSizeMax/Min` keys are also accepted.
         ```json
         {
             "doc_name": "MyFEMMesh",
@@ -359,41 +239,35 @@ def create_object(
             "obj_type": "Fem::FemMeshGmsh",
             "analysis_name": "MyFEMAnalysis",
             "obj_properties": {
-                "Part": "MyObject",
-                "ElementSizeMax": 10,
-                "ElementSizeMin": 0.1,
-                "MeshAlgorithm": 2
+                "Shape": "MyObject",
+                "CharacteristicLengthMax": 10,
+                "CharacteristicLengthMin": 0.1
             }
         }
         ```
     """
-    freecad = get_freecad_connection()
-    try:
-        obj_data = {"Name": obj_name, "Type": obj_type, "Properties": obj_properties or {}, "Analysis": analysis_name}
-        res = freecad.create_object(doc_name, obj_data)
-        screenshot = freecad.get_active_screenshot()
-        
-        if res["success"]:
-            response = [
-                TextContent(type="text", text=f"Object '{res['object_name']}' created successfully"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-        else:
-            response = [
-                TextContent(type="text", text=f"Failed to create object: {res['error']}"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-    except Exception as e:
-        logger.error(f"Failed to create object: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to create object: {str(e)}")
-        ]
+    return create_object_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        doc_name,
+        obj_type,
+        obj_name,
+        analysis_name,
+        obj_properties,
+        include_screenshot,
+        view_name,
+    )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def edit_object(
-    ctx: Context, doc_name: str, obj_name: str, obj_properties: dict[str, Any]
-    ) -> list[TextContent | ImageContent]:
+    ctx: Context,
+    doc_name: str,
+    obj_name: str,
+    obj_properties: dict[str, Any],
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
     """Edit an object in FreeCAD.
     This tool is used when the `create_object` tool cannot handle the object creation.
 
@@ -401,99 +275,135 @@ def edit_object(
         doc_name: The name of the document to edit the object in.
         obj_name: The name of the object to edit.
         obj_properties: The properties of the object to edit.
+        include_screenshot: Whether to return a screenshot of the model (default True).
+            Set to False to save tokens when visual feedback is not needed,
+            e.g. for intermediate steps in a longer sequence of changes.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
+            Pick the view that best shows the change being made.
 
     Returns:
         A message indicating the success or failure of the object editing and a screenshot of the object.
     """
-    freecad = get_freecad_connection()
-    try:
-        res = freecad.edit_object(doc_name, obj_name, obj_properties)
-        screenshot = freecad.get_active_screenshot()
-        
-        if res["success"]:
-            response = [
-                TextContent(type="text", text=f"Object '{res['object_name']}' edited successfully"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-        else:
-            response = [
-                TextContent(type="text", text=f"Failed to edit object: {res['error']}"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-    except Exception as e:
-        logger.error(f"Failed to edit object: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to edit object: {str(e)}")
-        ]
+    return edit_object_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        doc_name,
+        obj_name,
+        obj_properties,
+        include_screenshot,
+        view_name,
+    )
 
 
-@mcp.tool()
-def delete_object(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent | ImageContent]:
+@mcp.tool(structured_output=False)
+def delete_object(
+    ctx: Context,
+    doc_name: str,
+    obj_name: str,
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
     """Delete an object in FreeCAD.
 
     Args:
         doc_name: The name of the document to delete the object from.
         obj_name: The name of the object to delete.
+        include_screenshot: Whether to return a screenshot of the model (default True).
+            Set to False to save tokens when visual feedback is not needed,
+            e.g. for intermediate steps in a longer sequence of changes.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
+            Pick the view that best shows the change being made.
 
     Returns:
         A message indicating the success or failure of the object deletion and a screenshot of the object.
     """
-    freecad = get_freecad_connection()
-    try:
-        res = freecad.delete_object(doc_name, obj_name)
-        screenshot = freecad.get_active_screenshot()
-        
-        if res["success"]:
-            response = [
-                TextContent(type="text", text=f"Object '{res['object_name']}' deleted successfully"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-        else:
-            response = [
-                TextContent(type="text", text=f"Failed to delete object: {res['error']}"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-    except Exception as e:
-        logger.error(f"Failed to delete object: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to delete object: {str(e)}")
-        ]
+    return delete_object_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        doc_name,
+        obj_name,
+        include_screenshot,
+        view_name,
+    )
 
 
-@mcp.tool()
-def execute_code(ctx: Context, code: str) -> list[TextContent | ImageContent]:
+@mcp.tool(structured_output=False)
+def execute_code_async(ctx: Context, code: str) -> list[TextContent]:
+    """Execute Python code in FreeCAD without waiting for completion.
+
+    Use this ONLY for long-running background computations that do NOT touch the
+    FreeCAD GUI or mutate the FreeCAD document tree directly.
+
+    This tool runs the submitted code in a background thread and returns
+    immediately. Because it does not run on FreeCAD's main GUI thread, the code
+    must NOT call FreeCADGui APIs, manipulate the active view or selection, create
+    or edit document objects, change object properties, call doc.recompute(), or
+    save documents.
+
+    For code that touches FreeCAD documents, document objects, FreeCADGui, the
+    active view, selection, recompute, or save operations, use execute_code instead.
+    execute_code runs on the FreeCAD GUI thread and is the safe default for normal
+    FreeCAD automation.
+
+    Use execute_code_async only for background-safe work such as long-running
+    pure OCCT geometry calculations (e.g. fuse/cut/loft on already-fetched shapes)
+    or other CPU-bound computations that do not interact with the document or GUI.
+
+    Typical usage pattern:
+    1. Fetch shapes into local variables first (via execute_code on the GUI thread).
+    2. Store intermediate results in a module-level Python variable (not in the
+       FreeCAD document) so execute_code can read them later.
+    3. Run the heavy computation via execute_code_async.
+    4. After the expected computation time has elapsed, apply results to the
+       document via execute_code (which runs on the GUI thread).
+
+    Args:
+        code: Background-safe Python code to execute.
+
+    Returns:
+        A message confirming that background execution has started.
+    """
+    return execute_code_async_operation(get_freecad_connection(), code)
+
+
+@mcp.tool(structured_output=False)
+def execute_code(
+    ctx: Context,
+    code: str,
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
     """Execute arbitrary Python code in FreeCAD.
 
     Args:
         code: The Python code to execute.
+        include_screenshot: Whether to return a screenshot of the model (default True).
+            Set to False to save tokens when the code does not change the model's
+            appearance, e.g. analytical or computational scripts whose result is
+            printed output, or intermediate steps in a longer sequence of changes.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
+            Pick the view that best shows the change being made.
 
     Returns:
         A message indicating the success or failure of the code execution, the output of the code execution, and a screenshot of the object.
     """
-    freecad = get_freecad_connection()
-    try:
-        res = freecad.execute_code(code)
-        screenshot = freecad.get_active_screenshot()
-        
-        if res["success"]:
-            response = [
-                TextContent(type="text", text=f"Code executed successfully: {res['message']}"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-        else:
-            response = [
-                TextContent(type="text", text=f"Failed to execute code: {res['error']}"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-    except Exception as e:
-        logger.error(f"Failed to execute code: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to execute code: {str(e)}")
-        ]
+    return execute_code_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        code,
+        include_screenshot,
+        view_name,
+    )
 
 
-@mcp.tool()
-def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Right", "Back", "Left", "Bottom", "Dimetric", "Trimetric"]) -> list[ImageContent | TextContent]:
+@mcp.tool(structured_output=False)
+def get_view(
+    ctx: Context,
+    view_name: ViewName,
+    width: int | None = None,
+    height: int | None = None,
+    focus_object: str | None = None,
+) -> list[ImageContent | TextContent]:
     """Get a screenshot of the active view.
 
     Args:
@@ -508,311 +418,315 @@ def get_view(ctx: Context, view_name: Literal["Isometric", "Front", "Top", "Righ
         - "Bottom"
         - "Dimetric"
         - "Trimetric"
+        width: The width of the screenshot in pixels. If not specified, uses the viewport width.
+        height: The height of the screenshot in pixels. If not specified, uses the viewport height.
+        focus_object: The name of the object to focus on. If not specified, fits all objects in the view.
 
     Returns:
         A screenshot of the active view.
     """
-    freecad = get_freecad_connection()
-    screenshot = freecad.get_active_screenshot(view_name)
-    
-    if screenshot is not None:
-        return [ImageContent(type="image", data=screenshot, mimeType="image/png")]
-    else:
-        return [TextContent(type="text", text="Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)")]
+    return get_view_operation(get_freecad_connection(), view_name, width, height, focus_object)
 
 
-@mcp.tool()
-def insert_part_from_library(ctx: Context, relative_path: str) -> list[TextContent | ImageContent]:
+@mcp.tool(structured_output=False)
+def insert_part_from_library(
+    ctx: Context,
+    relative_path: str,
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
     """Insert a part from the parts library addon.
 
     Args:
         relative_path: The relative path of the part to insert.
+        include_screenshot: Whether to return a screenshot of the model (default True).
+            Set to False to save tokens when visual feedback is not needed,
+            e.g. for intermediate steps in a longer sequence of changes.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
+            Pick the view that best shows the change being made.
 
     Returns:
         A message indicating the success or failure of the part insertion and a screenshot of the object.
     """
-    freecad = get_freecad_connection()
-    try:
-        res = freecad.insert_part_from_library(relative_path)
-        screenshot = freecad.get_active_screenshot()
-        
-        if res["success"]:
-            response = [
-                TextContent(type="text", text=f"Part inserted from library: {res['message']}"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-        else:
-            response = [
-                TextContent(type="text", text=f"Failed to insert part from library: {res['error']}"),
-            ]
-            return add_screenshot_if_available(response, screenshot)
-    except Exception as e:
-        logger.error(f"Failed to insert part from library: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to insert part from library: {str(e)}")
-        ]
+    return insert_part_from_library_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        relative_path,
+        include_screenshot,
+        view_name,
+    )
 
 
-@mcp.tool()
-def get_objects(ctx: Context, doc_name: str) -> list[dict[str, Any]]:
+@mcp.tool(structured_output=False)
+def get_objects(
+    ctx: Context,
+    doc_name: str,
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
     """Get all objects in a document.
     You can use this tool to get the objects in a document to see what you can check or edit.
 
     Args:
         doc_name: The name of the document to get the objects from.
+        include_screenshot: Whether to return a screenshot of the document (default True).
+            Set to False to save tokens when only the object data is needed.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
 
     Returns:
         A list of objects in the document and a screenshot of the document.
     """
-    freecad = get_freecad_connection()
-    try:
-        screenshot = freecad.get_active_screenshot()
-        response = [
-            TextContent(type="text", text=json.dumps(freecad.get_objects(doc_name))),
-        ]
-        return add_screenshot_if_available(response, screenshot)
-    except Exception as e:
-        logger.error(f"Failed to get objects: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to get objects: {str(e)}")
-        ]
+    return get_objects_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        doc_name,
+        include_screenshot,
+        view_name,
+    )
 
 
-@mcp.tool()
-def get_object(ctx: Context, doc_name: str, obj_name: str) -> dict[str, Any]:
+@mcp.tool(structured_output=False)
+def get_object(
+    ctx: Context,
+    doc_name: str,
+    obj_name: str,
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
     """Get an object from a document.
     You can use this tool to get the properties of an object to see what you can check or edit.
 
     Args:
         doc_name: The name of the document to get the object from.
         obj_name: The name of the object to get.
+        include_screenshot: Whether to return a screenshot of the document (default True).
+            Set to False to save tokens when only the object data is needed.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
 
     Returns:
         The object and a screenshot of the object.
     """
-    freecad = get_freecad_connection()
-    try:
-        screenshot = freecad.get_active_screenshot()
-        response = [
-            TextContent(type="text", text=json.dumps(freecad.get_object(doc_name, obj_name))),
-        ]
-        return add_screenshot_if_available(response, screenshot)
-    except Exception as e:
-        logger.error(f"Failed to get object: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to get object: {str(e)}")
-        ]
+    return get_object_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        doc_name,
+        obj_name,
+        include_screenshot,
+        view_name,
+    )
 
 
-@mcp.tool()
-def get_parts_list(ctx: Context) -> list[str]:
+@mcp.tool(structured_output=False)
+def get_parts_list(ctx: Context) -> list[TextContent]:
     """Get the list of parts in the parts library addon.
     """
-    freecad = get_freecad_connection()
-    parts = freecad.get_parts_list()
-    if parts:
-        return [
-            TextContent(type="text", text=json.dumps(parts))
-        ]
-    else:
-        return [
-            TextContent(type="text", text=f"No parts found in the parts library. You must add parts_library addon.")
-        ]
+    return get_parts_list_operation(get_freecad_connection())
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
+def reload_document(ctx: Context, doc_name: str) -> list[TextContent]:
+    """Close and re-open a document to pick up external file changes.
+
+    Use this AFTER the document's .FCStd file has been modified by
+    something outside of FreeCAD's GUI process — for example, a
+    headless `freecadcmd` script that edited and saved the file. The
+    open GUI document is otherwise unaware of on-disk changes; this
+    tool closes the stale in-memory copy and reopens the file from
+    disk so the GUI shows current geometry.
+
+    Args:
+        doc_name: The name of the open document to reload. Must match
+            the name shown by ``list_documents``.
+
+    Returns:
+        A message confirming the document was reloaded, or describing
+        the failure (document not loaded, no associated file, etc).
+
+    Examples:
+        ```json
+        {
+            "doc_name": "chassis"
+        }
+        ```
+    """
+    return reload_document_operation(get_freecad_connection(), doc_name)
+
+
+@mcp.tool(structured_output=False)
+def list_documents(ctx: Context) -> list[TextContent]:
+    """Get the list of open documents in FreeCAD.
+
+    Returns:
+        A list of document names.
+    """
+    return list_documents_operation(get_freecad_connection())
+
+
+@mcp.tool(structured_output=False)
+def get_rpc_status(ctx: Context) -> list[TextContent]:
+    """Get RPC and FreeCAD GUI-dispatch health.
+
+    This tool does not use FreeCAD's GUI thread, so it remains available after
+    a GUI operation times out. A ``stuck`` state identifies the operation that
+    is still running and indicates that FreeCAD may need to be restarted.
+    """
+    return get_rpc_status_operation(get_freecad_connection())
+
+
+@mcp.tool(structured_output=False)
+def run_fem_analysis(
+    ctx: Context,
+    doc_name: str,
+    analysis_name: str,
+    timeout: int = 600,
+    include_screenshot: bool = True,
+    view_name: ViewName = "Isometric",
+) -> list[TextContent | ImageContent]:
+    """Run the CalculiX solver on an existing Fem::FemAnalysis container and return summary results.
+
+    Prerequisites in the document:
+    - A Part-derived solid (e.g. Part::Box, PartDesign::Body) acting as the geometry.
+    - A Fem::AnalysisPython container created via `create_object`.
+    - A Fem::MaterialCommon assigned to the geometry, added to the analysis.
+    - A Fem::FemMeshGmsh referencing the geometry, added to the analysis (the
+      mesh is generated automatically when created via `create_object`).
+    - At least one Fem::ConstraintFixed and one Fem::ConstraintForce (or
+      ConstraintPressure) bound to faces of the geometry, added to the analysis.
+
+    A SolverCcxTools is auto-created if the analysis has none.
+
+    The solver runs synchronously on the FreeCAD GUI thread and blocks all
+    other RPC calls for its duration; do not fan out parallel requests.
+
+    Returns max von Mises stress (MPa), max/min displacement (mm), node count,
+    and the working directory CalculiX wrote to. On failure, returns the
+    prerequisite-check or solver error along with the working directory for
+    triage.
+
+    Args:
+        doc_name: Name of the FreeCAD document.
+        analysis_name: Name of the Fem::AnalysisPython object.
+        timeout: Seconds to wait for the solver (default 600).
+        include_screenshot: Whether to return a screenshot of the model (default True).
+            Set to False to save tokens when only the numeric results are needed.
+        view_name: The view orientation of the returned screenshot (default "Isometric").
+    """
+    return run_fem_analysis_operation(
+        get_freecad_connection(),
+        state.only_text_feedback,
+        doc_name,
+        analysis_name,
+        timeout,
+        include_screenshot,
+        view_name,
+    )
+
+
+@mcp.tool(structured_output=False)
 def get_selection_buffer(ctx: Context) -> list[TextContent]:
-    """Get current selections from the FreeCAD selection buffer (non-destructive).
-    
-    This tool retrieves the objects that were explicitly sent to the MCP by the user
-    clicking the "Send Selection to MCP" button in FreeCAD. The selection buffer
-    maintains the user's selection order and persists until cleared.
-    
+    """Get the current contents of the FreeCAD selection buffer (non-destructive).
+
+    The buffer holds the objects the user explicitly handed over by selecting
+    them in FreeCAD and clicking "Send Selection to MCP" in the addon toolbar.
+    The user's selection order is preserved, each entry carries the object's
+    serialized properties plus a "SubElements" block listing the selected
+    faces/edges/vertices, and the data persists until `clear_selection_buffer`
+    is called, so operations can be retried against the same selection.
+
     Returns:
-        The current selection buffer contents with object details and metadata.
+        The selection buffer contents with object details, count and timestamp.
     """
-    freecad = get_freecad_connection()
-    try:
-        result = freecad.get_selection_buffer()
-        if result["success"]:
-            return [
-                TextContent(
-                    type="text", 
-                    text=f"Selection Buffer (count: {result['count']}, timestamp: {result['timestamp']}):\n" +
-                         json.dumps(result["selections"], indent=2)
-                )
-            ]
-        else:
-            return [
-                TextContent(type="text", text=f"Failed to get selection buffer: {result.get('error', 'Unknown error')}")
-            ]
-    except Exception as e:
-        logger.error(f"Failed to get selection buffer: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to get selection buffer: {str(e)}")
-        ]
+    return get_selection_buffer_operation(get_freecad_connection())
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_buffer_status(ctx: Context) -> list[TextContent]:
-    """Check the current state of the selection buffer.
-    
-    Returns information about whether the buffer has selections, count, and timestamp
-    without returning the actual selection data.
-    
+    """Check the state of the FreeCAD selection buffer.
+
+    Reports whether the buffer holds selections, how many, and when they were
+    captured, without transferring the (potentially large) selection payload.
+    Use it before `get_selection_buffer` to decide whether to ask the user to
+    send a selection.
+
     Returns:
-        Buffer status information.
+        Buffer status information (has_selections, count, timestamp).
     """
-    freecad = get_freecad_connection()
-    try:
-        result = freecad.get_buffer_status()
-        if result["success"]:
-            status = "✓ Has selections" if result["has_selections"] else "✗ Empty"
-            return [
-                TextContent(
-                    type="text", 
-                    text=f"Selection Buffer Status: {status}\n" +
-                         f"Count: {result['count']}\n" +
-                         f"Timestamp: {result['timestamp']}"
-                )
-            ]
-        else:
-            return [
-                TextContent(type="text", text=f"Failed to get buffer status: {result.get('error', 'Unknown error')}")
-            ]
-    except Exception as e:
-        logger.error(f"Failed to get buffer status: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to get buffer status: {str(e)}")
-        ]
+    return get_buffer_status_operation(get_freecad_connection())
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def clear_selection_buffer(ctx: Context) -> list[TextContent]:
-    """Clear the selection buffer after successful operation completion.
-    
-    This should only be called after the user confirms they are satisfied
-    with the AI model's work. This allows the model to retry operations
-    using the same selection data until the user is happy with the result.
-    
+    """Clear the FreeCAD selection buffer.
+
+    Only call this once the user confirms they are satisfied with the result.
+    Keeping the buffer populated lets the same selection be reused for retries
+    and refinements.
+
     Returns:
         Confirmation that the buffer has been cleared.
     """
-    freecad = get_freecad_connection()
-    try:
-        result = freecad.clear_selection_buffer()
-        if result["success"]:
-            return [
-                TextContent(type="text", text="✓ Selection buffer cleared successfully")
-            ]
-        else:
-            return [
-                TextContent(type="text", text=f"Failed to clear selection buffer: {result.get('error', 'Unknown error')}")
-            ]
-    except Exception as e:
-        logger.error(f"Failed to clear selection buffer: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to clear selection buffer: {str(e)}")
-        ]
+    return clear_selection_buffer_operation(get_freecad_connection())
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_selection_workflow_strategy(ctx: Context) -> list[TextContent]:
-    """Get the recommended workflow strategy for using the selection buffer.
-    
-    This tool provides the AI model with the proper workflow for managing
-    user selections and ensuring reliable operation retry capabilities.
-    
+    """Get the recommended workflow for working with the selection buffer.
+
+    Describes how to ask the user for a selection, retrieve it, iterate on the
+    operation and when to clear the buffer.
+
     Returns:
         The selection workflow strategy guide.
     """
-    freecad = get_freecad_connection()
-    try:
-        result = freecad.get_selection_workflow_strategy()
-        if result["success"]:
-            return [
-                TextContent(type="text", text=result["strategy"])
-            ]
-        else:
-            return [
-                TextContent(type="text", text=f"Failed to get workflow strategy: {result.get('error', 'Unknown error')}")
-            ]
-    except Exception as e:
-        logger.error(f"Failed to get workflow strategy: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to get workflow strategy: {str(e)}")
-        ]
+    return get_selection_workflow_strategy_operation(get_freecad_connection())
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_coordinate_handling_strategy(ctx: Context) -> list[TextContent]:
-    """Get best practices for handling coordinates from FreeCAD selections.
-    
-    This tool provides critical guidance on the correct way to extract and use
-    coordinates from FreeCAD selections, avoiding common double-transformation mistakes.
-    Use this tool when working with vertex coordinates, points, or any geometric data
-    extracted from user selections.
-    
+    """Get best practices for handling coordinates coming from FreeCAD selections.
+
+    Explains why selection sub-object coordinates are already global and must
+    not be transformed again with the object's Placement. Consult this before
+    using vertex points or other geometry taken from the selection buffer.
+
     Returns:
         Coordinate handling best practices and examples.
     """
-    freecad = get_freecad_connection()
-    try:
-        result = freecad.get_coordinate_handling_strategy()
-        if result["success"]:
-            return [
-                TextContent(type="text", text=result["strategy"])
-            ]
-        else:
-            return [
-                TextContent(type="text", text=f"Failed to get coordinate handling strategy: {result.get('error', 'Unknown error')}")
-            ]
-    except Exception as e:
-        logger.error(f"Failed to get coordinate handling strategy: {str(e)}")
-        return [
-            TextContent(type="text", text=f"Failed to get coordinate handling strategy: {str(e)}")
-        ]
+    return get_coordinate_handling_strategy_operation(get_freecad_connection())
 
 
 @mcp.prompt()
 def asset_creation_strategy() -> str:
-    return """
-Asset Creation Strategy for FreeCAD MCP
+    return ASSET_CREATION_STRATEGY
 
-When creating content in FreeCAD, always follow these steps:
 
-0. Before starting any task, always use get_objects() to confirm the current state of the document.
+def _validate_host(value: str) -> str:
+    """Validate that *value* is a valid IP address or hostname.
 
-1. Utilize the parts library:
-   - Check available parts using get_parts_list().
-   - If the required part exists in the library, use insert_part_from_library() to insert it into your document.
+    Used as the ``type`` callback for the ``--host`` argparse argument.
+    Raises ``argparse.ArgumentTypeError`` on invalid input.
+    """
+    import argparse
 
-2. If the appropriate asset is not available in the parts library:
-   - Create basic shapes (e.g., cubes, cylinders, spheres) using create_object().
-   - Adjust and define detailed properties of the shapes as necessary using edit_object().
+    import validators
 
-3. Always assign clear and descriptive names to objects when adding them to the document.
-
-4. Explicitly set the position, scale, and rotation properties of created or inserted objects using edit_object() to ensure proper spatial relationships.
-
-5. After editing an object, always verify that the set properties have been correctly applied by using get_object().
-
-6. If detailed customization or specialized operations are necessary, use execute_code() to run custom Python scripts.
-
-Only revert to basic creation methods in the following cases:
-- When the required asset is not available in the parts library.
-- When a basic shape is explicitly requested.
-- When creating complex shapes requires custom scripting.
-"""
+    if validators.ipv4(value) or validators.ipv6(value) or validators.hostname(value):
+        return value
+    raise argparse.ArgumentTypeError(
+        f"Invalid host: '{value}'. Must be a valid IP address or hostname."
+    )
 
 
 def main():
     """Run the MCP server"""
-    global _only_text_feedback
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--only-text-feedback", action="store_true", help="Only return text feedback")
+    parser.add_argument("--host", type=_validate_host, default="localhost", help="Host address of the FreeCAD RPC server to connect to (default: localhost)")
     args = parser.parse_args()
-    _only_text_feedback = args.only_text_feedback
-    logger.info(f"Only text feedback: {_only_text_feedback}")
+    state.only_text_feedback = args.only_text_feedback
+    state.rpc_host = args.host
+    logger.info(f"Only text feedback: {state.only_text_feedback}")
+    logger.info(f"Connecting to FreeCAD RPC server at: {state.rpc_host}")
     mcp.run()

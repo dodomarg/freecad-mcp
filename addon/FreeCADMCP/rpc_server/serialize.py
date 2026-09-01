@@ -2,6 +2,18 @@ import FreeCAD as App
 import json
 
 
+def _get_optional_app_type(name: str) -> type | tuple[type, ...] | None:
+    value = getattr(App, name, None)
+    if isinstance(value, type):
+        return value
+    if isinstance(value, tuple) and all(isinstance(item, type) for item in value):
+        return value
+    return None
+
+
+_COLOR_TYPE = _get_optional_app_type("Color")
+
+
 def serialize_value(value):
     if isinstance(value, (int, float, str, bool)):
         return value
@@ -19,7 +31,7 @@ def serialize_value(value):
         }
     elif isinstance(value, (list, tuple)):
         return [serialize_value(v) for v in value]
-    elif isinstance(value, (App.Color)):
+    elif _COLOR_TYPE is not None and isinstance(value, _COLOR_TYPE):
         return tuple(value)
     else:
         return str(value)
@@ -28,23 +40,35 @@ def serialize_value(value):
 def serialize_shape(shape):
     if shape is None:
         return None
-    return {
-        "Volume": shape.Volume,
-        "Area": shape.Area,
-        "VertexCount": len(shape.Vertexes),
-        "EdgeCount": len(shape.Edges),
-        "FaceCount": len(shape.Faces),
-    }
+    try:
+        return {
+            "Volume": shape.Volume,
+            "Area": shape.Area,
+            "VertexCount": len(shape.Vertexes),
+            "EdgeCount": len(shape.Edges),
+            "FaceCount": len(shape.Faces),
+        }
+    except Exception as e:
+        return {"error": f"invalid shape: {str(e)}"}
 
 
 def serialize_view_object(view):
     if view is None:
         return None
-    return {
-        "ShapeColor": serialize_value(view.ShapeColor),
-        "Transparency": view.Transparency,
-        "Visibility": view.Visibility,
-    }
+    result = {}
+    try:
+        result["ShapeColor"] = serialize_value(view.ShapeColor)
+    except AttributeError:
+        pass
+    try:
+        result["Transparency"] = view.Transparency
+    except AttributeError:
+        pass
+    try:
+        result["Visibility"] = view.Visibility
+    except AttributeError:
+        pass
+    return result
 
 
 def serialize_object(obj):
